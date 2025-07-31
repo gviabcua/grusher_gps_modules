@@ -18,3 +18,12 @@
 
     */1 * * * * /usr/bin/php /PATH/traccar_sync/start.php >> /dev/null 2>&1
 де PATH - ваш шлях до папки
+
+Запуск кожні 30 секунд
+    */1 * * * * /usr/bin/php /PATH/traccar_sync/start.php >> /dev/null 2>&1
+    */1 * * * * sh -c 'sleep 30 && /usr/bin/php /PATH/traccar_sync/start.php >> /dev/null 2>&1
+
+Запуск кожні 20 секунд
+    */1 * * * * /usr/bin/php /PATH/traccar_sync/start.php >> /dev/null 2>&1
+    */1 * * * * sh -c 'sleep 20 && /usr/bin/php /PATH/traccar_sync/start.php >> /dev/null 2>&1
+    */1 * * * * sh -c 'sleep 40 && /usr/bin/php /PATH/traccar_sync/start.php >> /dev/null 2>&1
