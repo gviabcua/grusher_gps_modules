@@ -1,1 +1,4 @@
 grusher_gps_module/config.php
+userside_sync/config.php
+traccar_sync/config.php
+mapon_sync/config.php
