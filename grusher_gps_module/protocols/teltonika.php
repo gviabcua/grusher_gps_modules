@@ -222,6 +222,9 @@ function processCodec8($data, &$offset, $endAVL, $recordCount, $connId, &$connec
         $ioData = parseIOElements($data, $offset, $endAVL);
 
         $imei = $connectionIMEIs[$connId] ?? 'unknown';
+        if(is_array($ioData) and !empty($ioData)){
+            ksort($ioData);
+        }
         clilogTracker("[$i] IMEI: $imei | $datetime | Lat: $latitude, Lon: $longitude, Speed: $speed, Angle: $angle, Alt: $altitude, Sats: $sats | IO: " . print_r($ioData, true), $protocol_name);
 
         sendToGrusher($imei, [
@@ -285,6 +288,9 @@ function processCodec8Extended($data, &$offset, $endAVL, $recordCount, $connId, 
         $ioData = parseIOElements8E($data, $offset, $endAVL, $totalIO);
 
         $imei = $connectionIMEIs[$connId] ?? 'unknown';
+        if(is_array($ioData) and !empty($ioData)){
+            ksort($ioData);
+        }
         clilogTracker("[$i] IMEI: $imei | $datetime | Lat: $latitude, Lon: $longitude, Speed: $speed, Angle: $angle, Alt: $altitude, Sats: $sats | IO: " . print_r($ioData, true), $protocol_name);
 
         sendToGrusher($imei, [
@@ -348,6 +354,9 @@ function processCodec16($data, &$offset, $endAVL, $recordCount, $connId, &$conne
         $ioData = parseIOElements8E($data, $offset, $endAVL, $totalIO); // Codec 16 uses same IO structure as 8E
 
         $imei = $connectionIMEIs[$connId] ?? 'unknown';
+        if(is_array($ioData) and !empty($ioData)){
+            ksort($ioData);
+        }
         clilogTracker("[$i] IMEI: $imei | $datetime | Lat: $latitude, Lon: $longitude, Speed: $speed, Angle: $angle, Alt: $altitude, Sats: $sats | IO: " . print_r($ioData, true), $protocol_name);
 
         sendToGrusher($imei, [
@@ -560,12 +569,15 @@ function mapFmbIo($io) {
         237 => 'Network_Type',
         10 => 'SD_Status',
         11 => 'ICCID1',
+
         30 => 'OBD_Number_of_DTC',
         31 => 'OBD_Engine_Load',
         32 => 'OBD_Coolant_Temperature',
         36 => 'OBD_Engine_RPM',
         37 => 'OBD_Vehicle_Speed',
-        43 => 'OBD_Distance_ormattin_MIL_on',
+        39 => 'OBD_Intake_Air_Temperature',
+        43 => 'OBD_Distance_Traveled_MIL_On',
+        44 => 'OBD_Fuel_Level ',
         48 => 'OBD_Fuel_Level',
         51 => 'OBD_Coolant_Temperature',
         52 => 'OBD_Fuel_Consumption',
@@ -573,9 +585,13 @@ function mapFmbIo($io) {
         54 => 'OBD_Throttle_Position',
         58 => 'OBD_Engine_Oil_Temperature',
         60 => 'OBD_Fuel_Rate',
+
+        113 => 'Battery_Level',
+
+
         256 => 'OBD_VIN',
         389 => 'Odometer_OEM_Total_Mileage',
-        390 => 'Fuel_Level_OEM',
+        390 => 'OBD_Fuel_Level',
         2001 => 'CAN_RPM',
         2002 => 'CAN_Speed',
         2003 => 'CAN_Fuel_Consumption',
@@ -606,12 +622,18 @@ function mapFmbIo($io) {
                 case 16:
                     $result[$mapping[$id]] = round(($value * 0.001), 0);
                     break;
+                case 60:
+                    $result[$mapping[$id]] = round(($value * 0.01), 0);
+                    break;
                 case 66:
                 case 67:
                     $result[$mapping[$id]] = round(($value * 0.001), 1);
                     break;
                 case 256:
                     $result[$mapping[$id]] = hex2bin($value);
+                    break;
+                case 390:
+                    $result[$mapping[$id]] = round(($value * 0.1), 1);
                     break;
                 default:
                     $result[$mapping[$id]] = $value;
