@@ -42,7 +42,7 @@
 		
 		$request = "&tracker_id=".urlencode($tracker_id);
 		foreach($data as $key => $value){
-			$request = "&".$key."=".urlencode($value);
+			$request .= "&".$key."=".urlencode($value);
 		}
 		$request = $GRUSHER_URL."/api?key=".$GRUSHER_API_KEY."&cat=billing&action=set_gps".$request;
 		echo "Sending to Grusher ". $request.PHP_EOL;
