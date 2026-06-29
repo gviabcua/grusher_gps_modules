@@ -576,10 +576,11 @@ function mapFmbIo($io) {
         36 => 'OBD_Engine_RPM',
         37 => 'OBD_Vehicle_Speed',
         39 => 'OBD_Intake_Air_Temperature',
+        42 => 'CAN_Engine_RPM',
         43 => 'OBD_Distance_Traveled_MIL_On',
         44 => 'OBD_Fuel_Level ',
         48 => 'OBD_Fuel_Level',
-        51 => 'OBD_Coolant_Temperature',
+        51 => 'OBD_Control_Module_Voltage',
         52 => 'OBD_Fuel_Consumption',
         53 => 'OBD_Speed',
         54 => 'OBD_Throttle_Position',
@@ -625,6 +626,7 @@ function mapFmbIo($io) {
                 case 60:
                     $result[$mapping[$id]] = round(($value * 0.01), 0);
                     break;
+                case 51:
                 case 66:
                 case 67:
                     $result[$mapping[$id]] = round(($value * 0.001), 1);
