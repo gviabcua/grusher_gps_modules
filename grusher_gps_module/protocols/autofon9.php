@@ -1,77 +1,79 @@
 <?php
-$protocol_name = explode(".", basename(__FILE__))[0];
-define("WORK_DIR", dirname(__FILE__));
-require_once(WORK_DIR . "/config.php");
-require_once(WORK_DIR . "/functions.php");
+/**
+ * Autofon SE-9 GPS protocol server
+ *
+ * WARNING: EXPERIMENTAL — the binary protocol for Autofon SE-9 is not publicly
+ * documented. The original implementation was entirely AI-fabricated with no
+ * real specification. This version logs raw packets so you can capture and
+ * analyse actual device traffic before implementing proper parsing.
+ *
+ */
 
-clilogTracker("Starting script for $protocol_name...", $protocol_name);
+$protocol_name = explode('.', basename(__FILE__))[0];
+define('WORK_DIR', dirname(dirname(__FILE__))); // FIX: was dirname(__FILE__)
+require_once WORK_DIR . '/config.php';
+require_once WORK_DIR . '/functions.php';
+
+clilogTracker("Starting server (STUB - logs raw data only)...", $protocol_name);
 
 set_time_limit(0);
 ini_set('max_execution_time', 0);
 ini_set('default_socket_timeout', -1);
 ini_set('max_input_time', -1);
 
-$host = "0.0.0.0";
-$options = getopt("p:");
-if (isset($options['p']) && (int)$options['p'] > 0 && (int)$options['p'] < 65536) {
-    $port = (int)$options['p'];
-} else {
-    clilogTracker("No port or invalid port specified", $protocol_name);
-    return;
+$options = getopt('p:');
+if (!isset($options['p']) || (int)$options['p'] <= 0 || (int)$options['p'] >= 65536) {
+    clilogTracker('Invalid or missing port (-p)', $protocol_name);
+    exit(1);
 }
+$port = (int)$options['p'];
+$host = '0.0.0.0';
 
-$connectionIMEIs = [];
-$socket = stream_socket_server("tcp://$host:$port", $errno, $errstr);
-if (!$socket) {
-    clilogTracker("Unable to create socket: $errstr ($errno)", $protocol_name);
-    return;
+$server = stream_socket_server("tcp://$host:$port", $errno, $errstr);
+if (!$server) {
+    clilogTracker("Cannot create socket: $errstr ($errno)", $protocol_name);
+    exit(1);
 }
-clilogTracker("Server started on $host:$port", $protocol_name);
+stream_set_blocking($server, false);
+clilogTracker("Server started on $host:$port (raw logging mode)", $protocol_name);
+
+$clients = [];
+$buffers = [];
 
 while (true) {
-    $conn = stream_socket_accept($socket);
-    if ($conn) {
-        $connId = intval($conn);
-        clilogTracker("New connection accepted", $protocol_name);
+    $read   = array_merge([$server], array_values($clients));
+    $write  = null;
+    $except = null;
 
-        while (true) {
-            $data = fread($conn, 2048);
-            if ($data === false || $data === '') {
-                clilogTracker("Connection closed by client", $protocol_name);
-                break;
+    if (stream_select($read, $write, $except, 0, 200000) < 1) {
+        continue;
+    }
+
+    foreach ($read as $sock) {
+        if ($sock === $server) {
+            $conn = stream_socket_accept($server);
+            if ($conn) {
+                stream_set_blocking($conn, false);
+                $id = (int)$conn;
+                $clients[$id] = $conn;
+                $buffers[$id] = '';
+                clilogTracker('New connection — logging raw data for protocol analysis', $protocol_name);
             }
-            clilogTracker("Received binary data: " . bin2hex($data), $protocol_name);
-
-            // Розбір даних Autofon 9 (приклад, структура залежить від протоколу)
-            // Припустимо, що IMEI у перших 15 байтах ASCII
-            $imeiRaw = substr($data, 0, 15);
-            $imei = preg_replace('/\D/', '', $imeiRaw);
-            $connectionIMEIs[$connId] = $imei;
-
-            // Тут додаємо парсинг GPS і інших даних згідно специфікації Autofon 9
-            // Для прикладу беремо довільні байти для координат (треба замінити на реальну логіку)
-            if (strlen($data) >= 25) {
-                $latRaw = unpack('N', substr($data, 15, 4))[1];
-                $lonRaw = unpack('N', substr($data, 19, 4))[1];
-                $latitude = $latRaw / 1000000;  // Приклад
-                $longitude = $lonRaw / 1000000;
-
-                clilogTracker("IMEI: $imei | Lat: $latitude, Lon: $longitude", $protocol_name);
-
-                sendToGrusher($imei, [
-                    "protocol_name" => $protocol_name,
-                    "last_alive" => date('Y-m-d H:i:s'),
-                    "lat" => $latitude,
-                    "lon" => $longitude,
-                ]);
-            } else {
-                clilogTracker("Incomplete data packet", $protocol_name);
-            }
+            continue;
         }
-        fclose($conn);
-        unset($connectionIMEIs[$connId]);
-        clilogTracker("Connection closed", $protocol_name);
+
+        $id   = (int)$sock;
+        $data = fread($sock, 4096);
+
+        if ($data === false || $data === '') {
+            clilogTracker('Connection closed', $protocol_name);
+            fclose($sock);
+            unset($clients[$id], $buffers[$id]);
+            continue;
+        }
+
+        // Log every raw byte — this is the data you need to analyse
+        clilogTracker('RAW HEX: ' . bin2hex($data), $protocol_name);
+        clilogTracker('RAW TXT: ' . addcslashes($data, "\x00..\x1F\x7F..\xFF"), $protocol_name);
     }
 }
-fclose($socket);
-?>

@@ -1,148 +1,163 @@
 <?php
-$protocol_name = explode(".", basename(__FILE__))[0];
-define("WORK_DIR", dirname(dirname(__FILE__)));
-require_once(WORK_DIR . "/config.php");
-require_once(WORK_DIR . "/functions.php");
+/**
+ * TK103 GPS protocol server (text-based, same family as GPS103)
+ *
+ * Packet format (ASCII, terminated by \r\n):
+ *   Login : imei:XXXXXXXXXXXXXXX,tracker;
+ *   GPS   : imei:...,tracker,DDMMYYHHMMSS,,F,DDMM.MMMM,N,DDDMM.MMMM,E,speed,course;
+ *
+ * TK103 uses the same text protocol as GPS103 with minor variations:
+ *   - May send seconds in datetime field
+ *   - Same NMEA coordinate format (DDMM.MMMM)
+ *   - Speed in knots
+ * 
+ */
 
-clilogTracker("Starting script...", $protocol_name);
-clilogTracker("WORK DIR is " . WORK_DIR, $protocol_name);
-clilogTracker("PROTOCOLS DIR is " . WORK_DIR . "/protocols", $protocol_name);
-clilogTracker("LOGS DIR is " . WORK_DIR . "/logs", $protocol_name);
+$protocol_name = explode('.', basename(__FILE__))[0];
+define('WORK_DIR', dirname(dirname(__FILE__)));
+require_once WORK_DIR . '/config.php';
+require_once WORK_DIR . '/functions.php';
+
+clilogTracker('Starting server...', $protocol_name);
 
 set_time_limit(0);
 ini_set('max_execution_time', 0);
 ini_set('default_socket_timeout', -1);
 ini_set('max_input_time', -1);
 
-$host = "0.0.0.0";
-clilogTracker("Getting port", $protocol_name);
-$options = getopt("p:");
-if (isset($options['p']) and ((int)$options['p'] > 0) and ((int)$options['p'] < 65536)) {
-	$port = (int)$options['p'];
-} else {
-	clilogTracker("No port, or port not correct", $protocol_name);
-	return;
+$options = getopt('p:');
+if (!isset($options['p']) || (int)$options['p'] <= 0 || (int)$options['p'] >= 65536) {
+    clilogTracker('Invalid or missing port (-p)', $protocol_name);
+    exit(1);
 }
+$port = (int)$options['p'];
+$host = '0.0.0.0';
 
+$server = stream_socket_server("tcp://$host:$port", $errno, $errstr);
+if (!$server) {
+    clilogTracker("Cannot create socket: $errstr ($errno)", $protocol_name);
+    exit(1);
+}
+stream_set_blocking($server, false);
+clilogTracker("Server started on $host:$port", $protocol_name);
+
+$clients         = [];
 $connectionIMEIs = [];
-$buffer = [];
-
-$socket = stream_socket_server("tcp://$host:$port", $errno, $errstr);
-if (!$socket) {
-	clilogTracker("Unable to create socket: $errstr ($errno)", $protocol_name);
-	return;
-}
-clilogTracker("Server started on {$host}:{$port}", $protocol_name);
+$buffers         = [];
 
 while (true) {
-	try {
-		$conn = stream_socket_accept($socket);
-		if ($conn) {
-			$connId = intval($conn);
-			clilogTracker("New connection established", $protocol_name);
-			$buffer[$connId] = '';
+    $read   = array_merge([$server], array_values($clients));
+    $write  = null;
+    $except = null;
 
-			while (true) {
-				$data = fread($conn, 1024);
-				if ($data === false || $data === '') {
-					clilogTracker("Connection closed by client", $protocol_name);
-					break;
-				}
-				$buffer[$connId] .= $data;
-				
-				while (($pos = strpos($buffer[$connId], "\r\n")) !== false) {
-					$line = substr($buffer[$connId], 0, $pos);
-					$buffer[$connId] = substr($buffer[$connId], $pos + 2);
-					clilogTracker("Received line: $line", $protocol_name);
-					processGpsDataTK103($conn, $line, $connId, $connectionIMEIs);
-				}
-			}
+    if (stream_select($read, $write, $except, 0, 200000) < 1) {
+        continue;
+    }
 
-			fclose($conn);
-			clilogTracker("Connection closed", $protocol_name);
-			unset($connectionIMEIs[$connId]);
-			unset($buffer[$connId]);
-		}
-	} catch (\Exception $e) {
-		clilogTracker("Error processing connection: " . $e->getMessage(), $protocol_name);
-	}
+    foreach ($read as $sock) {
+        if ($sock === $server) {
+            $conn = stream_socket_accept($server);
+            if ($conn) {
+                stream_set_blocking($conn, false);
+                $id = (int)$conn;
+                $clients[$id] = $conn;
+                $buffers[$id] = '';
+                clilogTracker('New connection', $protocol_name);
+            }
+            continue;
+        }
+
+        $id   = (int)$sock;
+        $data = fread($sock, 2048);
+
+        if ($data === false || $data === '') {
+            clilogTracker('Connection closed', $protocol_name);
+            fclose($sock);
+            unset($clients[$id], $connectionIMEIs[$id], $buffers[$id]);
+            continue;
+        }
+
+        $buffers[$id] .= $data;
+
+        while (($pos = strpos($buffers[$id], "\n")) !== false) {
+            $line           = rtrim(substr($buffers[$id], 0, $pos), "\r\n");
+            $buffers[$id]   = substr($buffers[$id], $pos + 1);
+            if ($line === '') continue;
+            clilogTracker("Line: $line", $protocol_name);
+            parseTK103Line($sock, $line, $id, $connectionIMEIs, $protocol_name);
+        }
+    }
 }
 
-function processGpsDataTK103($conn, $line, $connId, &$connectionIMEIs) {
-	global $protocol_name;
-	// Зберігаємо IMEI з рядка, що починається на imei:
-	if (str_starts_with($line, 'imei:')) {
-		$parts = explode(',', $line);
-		$imei = substr($parts[0], 5);
-		$connectionIMEIs[$connId] = $imei;
-		clilogTracker("IMEI is: $imei", $protocol_name);
-		return;
-	}
-	if (!isset($connectionIMEIs[$connId])) {
-		clilogTracker("IMEI not yet received, ignoring data", $protocol_name);
-		return;
-	}
-	$imei = $connectionIMEIs[$connId];
-	$parts = explode(',', $line);
-	// Приклад мінімальних даних TK103: [tracker, datetime, , F, lat, N/S, lon, E/W, speed, ...]
-	if (count($parts) >= 9) {
-		$valid = trim($parts[3]) === 'F';
-		if (!$valid) {
-			clilogTracker("GPS data not valid", $protocol_name);
-			return;
-		}
-		$dt_str = $parts[1]; // дата і час у форматі ддммррггггччммсс або ддммррггггччмм
-		if (strlen($dt_str) < 10) {
-			clilogTracker("Invalid date/time string: $dt_str", $protocol_name);
-			return;
-		}
-		// Визначаємо дату і час (ддммррггггччммсс)
-		$day = substr($dt_str, 0, 2);
-		$month = substr($dt_str, 2, 2);
-		$year = substr($dt_str, 4, 2);
-		$hour = substr($dt_str, 6, 2);
-		$min = substr($dt_str, 8, 2);
-		$sec = strlen($dt_str) >= 12 ? substr($dt_str, 10, 2) : "00";
-		$year = 2000 + (int)$year;
-		$datetime = sprintf("%04d-%02d-%02d %02d:%02d:%02d", $year, $month, $day, $hour, $min, $sec);
-		// Конвертація координат з формату DDMM.MMMM у десяткові градуси
-		$lat_raw = $parts[4];
-		$lat_dir = strtoupper($parts[5]);
-		$lon_raw = $parts[6];
-		$lon_dir = strtoupper($parts[7]);
-		$latitude = tk103CoordToDecimal($lat_raw, $lat_dir);
-		$longitude = tk103CoordToDecimal($lon_raw, $lon_dir);
-		$speed_knots = floatval($parts[8]);
-		$speed_kmh = $speed_knots * 1.852; // конвертація вузлів у км/год
+// ─────────────────────────────────────────────────────
+function parseTK103Line($conn, $line, $id, &$connectionIMEIs, $protocol_name) {
+    $line  = rtrim($line, ';');
+    $parts = explode(',', $line);
 
-		clilogTracker("TK103: IMEI: $imei | $datetime | Lat: $latitude, Lon: $longitude, Speed: $speed_kmh km/h", $protocol_name);
-		sendToGrusher($imei, [
-			"protocol_name" => $protocol_name,
-			"last_alive" => $datetime,
-			"lat" => $latitude,
-			"lon" => $longitude,
-			"speed" => $speed_kmh,
-		]);
-		// Відповідь OK, щоб пристрій не закривав з'єднання
-		fwrite($conn, "ON\r\n");
-	} else {
-		clilogTracker("TK103: Unexpected data format: $line", $protocol_name);
-	}
+    // ── Login ────────────────────────────────────
+    if (str_starts_with($parts[0], 'imei:')) {
+        $imei = preg_replace('/\D/', '', substr($parts[0], 5));
+        $connectionIMEIs[$id] = $imei;
+        clilogTracker("IMEI: $imei", $protocol_name);
+        return;
+    }
+
+    // ── Data ─────────────────────────────────────
+    if (!isset($connectionIMEIs[$id])) {
+        clilogTracker('No IMEI yet — ignored', $protocol_name);
+        return;
+    }
+    $imei = $connectionIMEIs[$id];
+
+    if (count($parts) < 9) {
+        clilogTracker("Too few fields: $line", $protocol_name);
+        return;
+    }
+
+    $validity = strtoupper(trim($parts[3]));
+    if ($validity !== 'F') {
+        clilogTracker("GPS invalid (validity=$validity)", $protocol_name);
+        fwrite($conn, "ON\r\n");
+        return;
+    }
+
+    $dt  = $parts[1];
+    if (strlen($dt) < 10) {
+        clilogTracker("Bad datetime: $dt", $protocol_name);
+        return;
+    }
+    $day = substr($dt, 0, 2);
+    $mon = substr($dt, 2, 2);
+    $yr  = 2000 + (int)substr($dt, 4, 2);
+    $hr  = substr($dt, 6, 2);
+    $min = substr($dt, 8, 2);
+    $sec = (strlen($dt) >= 12) ? substr($dt, 10, 2) : '00';
+    $datetime = sprintf('%04d-%02d-%02d %02d:%02d:%02d', $yr, $mon, $day, $hr, $min, $sec);
+
+    $lat = nmeaToDecimalTK((float)$parts[4], strtoupper($parts[5]));
+    $lon = nmeaToDecimalTK((float)$parts[6], strtoupper($parts[7]));
+
+    $speed_kmh = round((float)$parts[8] * 1.852, 1);
+
+    clilogTracker(
+        "TK103 IMEI:$imei $datetime Lat:$lat Lon:$lon Spd:{$speed_kmh}km/h",
+        $protocol_name
+    );
+
+    sendToGrusher($imei, [
+        'protocol_name' => $protocol_name,
+        'last_alive'    => $datetime,
+        'lat'           => $lat,
+        'lon'           => $lon,
+        'speed'         => $speed_kmh,
+    ]);
+
+    fwrite($conn, "ON\r\n");
 }
 
-function tk103CoordToDecimal($coord, $direction) {
-	// Конвертація DDMM.MMMM -> десятинні градуси
-	// Приклад: 2232.1234 -> 22 градуси, 32.1234 хвилин
-	if (strpos($coord, '.') === false) return 0;
-	$parts = explode('.', $coord);
-	if (strlen($parts[0]) <= 2) return 0;
-	$degrees_len = (strlen($parts[0]) == 4) ? 2 : 3; // широта має 2 градуси, довгота 3
-	$degrees = (int)substr($coord, 0, $degrees_len);
-	$minutes = floatval(substr($coord, $degrees_len));
-	$decimal = $degrees + ($minutes / 60);
-	if ($direction == 'S' || $direction == 'W') {
-		$decimal = -$decimal;
-	}
-	return $decimal;
+function nmeaToDecimalTK(float $nmea, string $dir): float {
+    $degrees = floor($nmea / 100.0);
+    $minutes = $nmea - $degrees * 100.0;
+    $decimal = $degrees + $minutes / 60.0;
+    return ($dir === 'S' || $dir === 'W') ? -$decimal : $decimal;
 }
-?>
