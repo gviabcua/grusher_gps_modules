@@ -1,89 +1,24 @@
 <?php
-/**
- * GT02A GPS protocol server (binary TCP)
- *
- * Packet format (very similar to GT06):
- *   Start  : 0x7878
- *   Len    : 1 byte (number of bytes that follow, before 0D0A)
- *   Cmd    : 1 byte
- *   Body   : variable
- *   Serial : 2 bytes
- *   CRC    : 2 bytes (CRC-16/IBM over Cmd+Body+Serial)
- *   End    : 0x0D0A
- *
- *   Login  cmd=0x01: 8-byte IMEI (BCD, 15 digits in 8 bytes, last nibble = 0xF pad)
- *   GPS    cmd=0x12/0x22: datetime(6) + sat_info(1) + lat(4) + lon(4) + speed(1) + course_status(2) + serial(2)
- *
- */
+// GT02A GPS protocol server (binary TCP)
 
 $protocol_name = explode('.', basename(__FILE__))[0];
 define('WORK_DIR', dirname(dirname(__FILE__)));
 require_once WORK_DIR . '/config.php';
 require_once WORK_DIR . '/functions.php';
+require_once WORK_DIR . '/gps_server.php';
 
-clilogTracker('Starting server...', $protocol_name);
-
-set_time_limit(0);
-ini_set('max_execution_time', 0);
-ini_set('default_socket_timeout', -1);
-ini_set('max_input_time', -1);
-
-$options = getopt('p:');
-if (!isset($options['p']) || (int)$options['p'] <= 0 || (int)$options['p'] >= 65536) {
-    clilogTracker('Invalid or missing port (-p)', $protocol_name);
-    exit(1);
-}
-$port = (int)$options['p'];
-$host = '0.0.0.0';
-
-$server = stream_socket_server("tcp://$host:$port", $errno, $errstr);
-if (!$server) {
-    clilogTracker("Cannot create socket: $errstr ($errno)", $protocol_name);
-    exit(1);
-}
-stream_set_blocking($server, false);
-clilogTracker("Server started on $host:$port", $protocol_name);
-
-$clients         = [];
 $connectionIMEIs = [];
-$buffers         = [];
 
-while (true) {
-    $read   = array_merge([$server], array_values($clients));
-    $write  = null;
-    $except = null;
+$server = gpsBootstrap($protocol_name);
 
-    if (stream_select($read, $write, $except, 0, 200000) < 1) {
-        continue;
+$server->run(
+    function ($conn, $id, &$buffers, GpsServer $srv) use (&$connectionIMEIs, $protocol_name) {
+        processGT02ABuffer($conn, $id, $buffers, $connectionIMEIs, $protocol_name);
+    },
+    function ($id) use (&$connectionIMEIs) {
+        unset($connectionIMEIs[$id]);
     }
-
-    foreach ($read as $sock) {
-        if ($sock === $server) {
-            $conn = stream_socket_accept($server);
-            if ($conn) {
-                stream_set_blocking($conn, false);
-                $id = (int)$conn;
-                $clients[$id] = $conn;
-                $buffers[$id] = '';
-                clilogTracker('New connection', $protocol_name);
-            }
-            continue;
-        }
-
-        $id   = (int)$sock;
-        $data = fread($sock, 2048);
-
-        if ($data === false || $data === '') {
-            clilogTracker('Connection closed', $protocol_name);
-            fclose($sock);
-            unset($clients[$id], $connectionIMEIs[$id], $buffers[$id]);
-            continue;
-        }
-
-        $buffers[$id] .= $data;
-        processGT02ABuffer($sock, $id, $buffers, $connectionIMEIs, $protocol_name);
-    }
-}
+);
 
 // ─────────────────────────────────────────────────────
 function processGT02ABuffer($conn, $id, &$buffers, &$connectionIMEIs, $protocol_name) {
@@ -111,6 +46,11 @@ function processGT02ABuffer($conn, $id, &$buffers, &$connectionIMEIs, $protocol_
         $bodyLen = ord($buf[2]);
         $total   = 2 + 1 + $bodyLen + 2;
 
+        if ($bodyLen < 5) {
+            clilogTracker("Implausible frame length $bodyLen — resyncing", $protocol_name);
+            $buffers[$id] = substr($buf, 2);
+            continue;
+        }
         if ($len < $total) return;
 
         // Verify end marker
@@ -143,6 +83,8 @@ function parseGT02APacket($conn, $packet, $id, &$connectionIMEIs, $protocol_name
             if ($h <= 9) $imei .= $h;
             if ($l <= 9) $imei .= $l; // skip 0xF padding
         }
+        // 15-digit IMEIs are padded with a leading zero nibble; drop it so the tracker id matches what GT06 and the other protocols report.
+        $imei = ltrim($imei, '0');
         $connectionIMEIs[$id] = $imei;
         clilogTracker("IMEI: $imei", $protocol_name);
 
@@ -220,27 +162,31 @@ function parseGT02APacket($conn, $packet, $id, &$connectionIMEIs, $protocol_name
         return;
     }
 
-    clilogTracker('Unknown GT02A cmd 0x' . dechex($cmd), $protocol_name);
+    // Heartbeat and status frames must be acknowledged too, otherwise the device treats the link as dead and reconnects in a loop.
+    clilogTracker('GT02A cmd 0x' . sprintf('%02X', $cmd) . ' — acknowledged', $protocol_name);
+    sendGT02AAck($conn, $cmd, substr($packet, -4, 2));
 }
 
 function sendGT02AAck($conn, $cmd, $serial) {
-    // Body = cmd(1) + serial(2) — CRC covers body
-    $body    = chr($cmd) . $serial;
+    // Frame = 7878 <len> <cmd> <serial:2> <crc:2> 0D0A, CRC over <len>…<serial>
+    $lenByte = chr(5);
+    $body    = $lenByte . chr($cmd) . $serial;
     $crc     = crc16gt02a($body);
-    $crcHex  = str_pad(dechex($crc), 4, '0', STR_PAD_LEFT);
-    $lenByte = chr(strlen($body) + 2); // body + crc(2)
-    $ack     = "\x78\x78" . $lenByte . $body . hex2bin($crcHex) . "\x0D\x0A";
-    fwrite($conn, $ack);
+    // pack() instead of hex2bin(dechex()): dechex() drops leading zeroes and
+    // produced an odd-length string that hex2bin() rejected.
+    $ack     = "\x78\x78" . $body . pack('n', $crc) . "\x0D\x0A";
+    safeFwrite($conn, $ack);
 }
 
-// CRC-16/IBM (same as GT06)
+// CRC-16/X25 ("CRC-ITU") — the checksum GT02A/GT06 devices actually use.
 function crc16gt02a(string $buf): int {
     $crc = 0xFFFF;
-    for ($i = 0; $i < strlen($buf); $i++) {
+    $len = strlen($buf);
+    for ($i = 0; $i < $len; $i++) {
         $crc ^= ord($buf[$i]);
         for ($j = 0; $j < 8; $j++) {
-            $crc = ($crc & 0x01) ? (($crc >> 1) ^ 0xA001) : ($crc >> 1);
+            $crc = ($crc & 0x01) ? (($crc >> 1) ^ 0x8408) : ($crc >> 1);
         }
     }
-    return $crc & 0xFFFF;
+    return (~$crc) & 0xFFFF;
 }

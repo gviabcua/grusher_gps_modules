@@ -9,133 +9,100 @@ $protocol_name = explode(".", basename(__FILE__))[0];
 define("WORK_DIR", dirname(dirname(__FILE__)));
 require_once WORK_DIR . "/config.php";
 require_once WORK_DIR . "/functions.php";
+require_once WORK_DIR . "/gps_server.php";
 
-// Initialize logging
-clilogTracker("Starting GPS server...", $protocol_name);
-
-// Set PHP runtime configurations
-set_time_limit(0);
-ini_set('max_execution_time', 0);
-ini_set('default_socket_timeout', -1);
-ini_set('max_input_time', -1);
-
-// Get port from command line arguments
-$options = getopt("p:");
-if (!isset($options['p']) || (int)$options['p'] <= 0 || (int)$options['p'] >= 65536) {
-    clilogTracker("Invalid or missing port number", $protocol_name);
-    exit(1);
-}
-$port = (int)$options['p'];
-$host = "0.0.0.0";
-
-// Create TCP server socket
-$server = stream_socket_server("tcp://{$host}:{$port}", $errno, $errstr);
-if (!$server) {
-    clilogTracker("Failed to create socket: $errstr ($errno)", $protocol_name);
-    exit(1);
-}
-stream_set_blocking($server, false);
-
-clilogTracker("Server started on {$host}:{$port}", $protocol_name);
-
-// Initialize client tracking
-$clients = [];          // Active client connections
 $connectionIMEIs = []; // Mapping of connection ID to IMEI
 
-// Main server loop
-while (true) {
-    $read = array_merge([$server], array_values($clients));
-    $write = $except = null;
+$server = gpsBootstrap($protocol_name);
 
-    // Check for socket activity
-    if (stream_select($read, $write, $except, 0, 200000) > 0) {
-        foreach ($read as $sock) {
-            if ($sock === $server) {
-                // Handle new connection
-                if ($conn = stream_socket_accept($server)) {
-                    stream_set_blocking($conn, false);
-                    $clients[(int)$conn] = $conn;
-                    clilogTracker("New connection established", $protocol_name);
-                }
+$server->run(
+    function ($conn, $id, &$buffers, GpsServer $srv) use (&$connectionIMEIs, $protocol_name) {
+        processTeltonikaBuffer($conn, $id, $buffers, $connectionIMEIs, $protocol_name);
+    },
+    function ($id) use (&$connectionIMEIs) {
+        unset($connectionIMEIs[$id]);
+    }
+);
+
+/**
+ * Pull complete Teltonika frames out of the receive buffer.
+ *
+ * TCP is a byte stream: a device may split one AVL packet across several
+ * segments, or pack the IMEI handshake and the first AVL packet into a single
+ * one. 
+ */
+function processTeltonikaBuffer($conn, $connId, &$buffers, &$connectionIMEIs, $protocol_name) {
+    while (true) {
+        $buf      = $buffers[$connId];
+        $totalLen = strlen($buf);
+
+        if ($totalLen < 2) return;
+
+        // ── IMEI handshake: length(2) + ASCII digits ──
+        $len = unpack("n", substr($buf, 0, 2))[1];
+        if ($len > 0 && $len <= 15) {
+            if ($totalLen < 2 + $len) return; // wait for the rest
+            $imei = substr($buf, 2, $len);
+            $buffers[$connId] = substr($buf, 2 + $len);
+
+            if (preg_match('/^\d{15}$/', $imei)) {
+                clilogTracker("IMEI received: $imei", $protocol_name);
+                $connectionIMEIs[$connId] = $imei;
+                safeFwrite($conn, chr(1)); // accept
             } else {
-                // Handle client data
-                $payload = fread($sock, 8192);
-                if ($payload === '' || $payload === false) {
-                    // Client disconnected
-                    clilogTracker("Connection closed", $protocol_name);
-                    unset($clients[(int)$sock], $connectionIMEIs[(int)$sock]);
-                    fclose($sock);
-                } else {
-                    processGpsData($sock, bin2hex($payload), $connectionIMEIs);
-                }
+                clilogTracker("Invalid IMEI format: " . bin2hex($imei), $protocol_name);
+                safeFwrite($conn, chr(0)); // reject
             }
+            continue;
         }
+
+        // ── AVL packet: preamble(4) + length(4) + data + CRC(4) ──
+        if ($totalLen < 12) return;
+
+        $preamble = unpack("N", substr($buf, 0, 4))[1];
+        if ($preamble !== 0) {
+            clilogTracker(
+                "Invalid preamble: " . sprintf("%08X", $preamble) . " — dropping connection",
+                $protocol_name
+            );
+            $buffers[$connId] = '';
+            throw new RuntimeException('protocol desync');
+        }
+
+        $avlLength = unpack("N", substr($buf, 4, 4))[1];
+        if ($avlLength < 3 || $avlLength > 65535) {
+            clilogTracker("Implausible AVL length $avlLength — dropping connection", $protocol_name);
+            $buffers[$connId] = '';
+            throw new RuntimeException('protocol desync');
+        }
+
+        $frameLen = 8 + $avlLength + 4;
+        if ($totalLen < $frameLen) return; // wait for the rest of the frame
+
+        $frame            = substr($buf, 0, $frameLen);
+        $buffers[$connId] = substr($buf, $frameLen);
+
+        processGpsData($conn, $frame, $connId, $connectionIMEIs);
     }
 }
 
 /**
- * Process raw hex payload from GPS device
- * Handles IMEI and AVL packets for all Teltonika codecs
+ * Process one complete AVL frame.
  *
- * @param resource $conn Socket connection
- * @param string $hex Hex-encoded payload
- * @param array $connectionIMEIs Reference to IMEI mapping
+ * @param resource $conn   Socket connection
+ * @param string   $data   Complete frame (preamble … CRC)
+ * @param int      $connId Connection id
+ * @param array    $connectionIMEIs Reference to IMEI mapping
  */
-function processGpsData($conn, $hex, &$connectionIMEIs) {
+function processGpsData($conn, $data, $connId, &$connectionIMEIs) {
     global $protocol_name;
-    $data = hex2bin($hex);
-    $connId = (int)$conn;
     $totalLen = strlen($data);
-    clilogTracker("Received data length: $totalLen", $protocol_name);
+    clilogTracker("Received AVL frame, length: $totalLen", $protocol_name);
 
-    // Handle IMEI packet
-    if ($totalLen >= 2) {
-        $len = unpack("n", substr($data, 0, 2))[1];
-        if ($len > 0 && $len <= 15 && $totalLen >= 2 + $len) {
-            $imei = substr($data, 2, $len);
-            if (preg_match('/^\d{15}$/', $imei)) {
-                clilogTracker("IMEI received: $imei", $protocol_name);
-                $connectionIMEIs[$connId] = $imei;
-                fwrite($conn, chr(1)); // Send IMEI ACK
-                return;
-            } else {
-                clilogTracker("Invalid IMEI format: $imei", $protocol_name);
-                return;
-            }
-        }
-    }
-
-    // Handle AVL packet
-    if ($totalLen < 12) {
-        clilogTracker("Packet too small for AVL", $protocol_name);
-        return;
-    }
-
-    $offset = 0;
-
-    // Read preamble (4 bytes, should be 0x00000000 for TCP)
-    $preamble = unpack("N", substr($data, $offset, 4))[1];
-    if ($preamble !== 0) {
-        clilogTracker("Invalid preamble: " . sprintf("%08X", $preamble), $protocol_name);
-        return;
-    }
-    $offset += 4;
-
-    // Read AVL data length (4 bytes)
-    $avlLengthRaw = substr($data, $offset, 4);
-    if (strlen($avlLengthRaw) < 4) {
-        clilogTracker("Insufficient bytes for AVL length", $protocol_name);
-        return;
-    }
-    $avlLength = unpack("N", $avlLengthRaw)[1];
-    $offset += 4;
-
-    $startAVL = $offset;
-    $endAVL = $startAVL + $avlLength;
-    if ($totalLen < $endAVL + 4) {
-        clilogTracker("Incomplete AVL packet: expected " . ($endAVL + 4) . " bytes, got $totalLen", $protocol_name);
-        return;
-    }
+    $offset    = 8;
+    $avlLength = unpack("N", substr($data, 4, 4))[1];
+    $startAVL  = $offset;
+    $endAVL    = $startAVL + $avlLength;
 
     // Read codec ID and record count
     $codecId = ord($data[$offset++]);
@@ -164,28 +131,54 @@ function processGpsData($conn, $hex, &$connectionIMEIs) {
         $processed = processCodec16($data, $offset, $endAVL, $recordCount, $connId, $connectionIMEIs);
     }
 
-    // Read second record count and CRC
-    if ($offset + 1 > $endAVL) {
-        clilogTracker("Missing second record counter for ACK", $protocol_name);
-        return;
-    }
-    $records2 = ord($data[$offset++]);
+    // Second record counter is the last byte of the AVL block
+    $records2 = ord($data[$endAVL - 1]);
     if ($records2 !== $recordCount) {
         clilogTracker("Record count mismatch: $recordCount != $records2", $protocol_name);
     }
 
-    if ($offset + 4 > $totalLen) {
-        clilogTracker("Missing CRC bytes", $protocol_name);
-        return;
+    // CRC-16/IBM over the AVL block (codec id … second record counter)
+    $crcExpected = unpack("N", substr($data, $endAVL, 4))[1] & 0xFFFF;
+    $crcActual   = teltonikaCrc16(substr($data, $startAVL, $avlLength));
+    if ($crcExpected !== $crcActual) {
+        clilogTracker(
+            sprintf("CRC mismatch: packet=%04X calculated=%04X", $crcExpected, $crcActual),
+            $protocol_name
+        );
     }
-    $crc = unpack("N", substr($data, $offset, 4))[1];
 
-    // Basic CRC validation (optional, implement as needed)
-    // Note: Teltonika CRC-16-IBM can be added here if required
+    // ACK with the number of accepted records. This must always be sent —
+    // without it the device replays the same packet forever.
+    safeFwrite($conn, pack("N", $recordCount));
+    clilogTracker("Sent ACK for $recordCount records ($processed parsed)", $protocol_name);
+}
 
-    // Send ACK with number of accepted records
-    fwrite($conn, pack("N", $processed));
-    clilogTracker("Sent ACK for $processed records", $protocol_name);
+/**
+ * Convert a Teltonika millisecond timestamp to "Y-m-d H:i:s".
+ *
+ * intdiv() instead of "/ 1000": passing a float to date() is deprecated in
+ * PHP 8.1+ and every record emitted a deprecation notice. Implausible values
+ * (a corrupt record, or a device with no RTC yet) fall back to server time.
+ */
+function teltonikaDatetime($timestampMs) {
+    $seconds = is_int($timestampMs) ? intdiv($timestampMs, 1000) : (int)((float)$timestampMs / 1000);
+    if ($seconds < 946684800 || $seconds > time() + 86400) { // < 2000-01-01 or > +1 day
+        return date("Y-m-d H:i:s");
+    }
+    return date("Y-m-d H:i:s", $seconds);
+}
+
+/** CRC-16/IBM (poly 0xA001, init 0x0000) as used by Teltonika. */
+function teltonikaCrc16(string $buf): int {
+    $crc = 0;
+    $len = strlen($buf);
+    for ($i = 0; $i < $len; $i++) {
+        $crc ^= ord($buf[$i]);
+        for ($j = 0; $j < 8; $j++) {
+            $crc = ($crc & 0x01) ? (($crc >> 1) ^ 0xA001) : ($crc >> 1);
+        }
+    }
+    return $crc & 0xFFFF;
 }
 
 /**
@@ -205,7 +198,7 @@ function processCodec8($data, &$offset, $endAVL, $recordCount, $connId, &$connec
 
         $timestamp = unpack64be(substr($data, $offset, 8));
         $offset += 8;
-        $datetime = date("Y-m-d H:i:s", $timestamp / 1000);
+        $datetime = teltonikaDatetime($timestamp);
         $priority = ord($data[$offset++]);
         $longitude = parseSignedInt32(substr($data, $offset, 4)) / 10000000;
         $offset += 4;
@@ -221,7 +214,11 @@ function processCodec8($data, &$offset, $endAVL, $recordCount, $connId, &$connec
 
         $ioData = parseIOElements($data, $offset, $endAVL);
 
-        $imei = $connectionIMEIs[$connId] ?? 'unknown';
+        $imei = $connectionIMEIs[$connId] ?? null;
+        if ($imei === null) {
+            clilogTracker("Record #$i received before the IMEI handshake — skipped", $protocol_name);
+            continue;
+        }
         if(is_array($ioData) and !empty($ioData)){
             ksort($ioData);
         }
@@ -262,7 +259,7 @@ function processCodec8Extended($data, &$offset, $endAVL, $recordCount, $connId, 
 
         $timestamp = unpack64be(substr($data, $offset, 8));
         $offset += 8;
-        $datetime = date("Y-m-d H:i:s", $timestamp / 1000);
+        $datetime = teltonikaDatetime($timestamp);
         $priority = ord($data[$offset++]);
         $longitude = parseSignedInt32(substr($data, $offset, 4)) / 10000000;
         $offset += 4;
@@ -287,7 +284,11 @@ function processCodec8Extended($data, &$offset, $endAVL, $recordCount, $connId, 
 
         $ioData = parseIOElements8E($data, $offset, $endAVL, $totalIO);
 
-        $imei = $connectionIMEIs[$connId] ?? 'unknown';
+        $imei = $connectionIMEIs[$connId] ?? null;
+        if ($imei === null) {
+            clilogTracker("Record #$i received before the IMEI handshake — skipped", $protocol_name);
+            continue;
+        }
         if(is_array($ioData) and !empty($ioData)){
             ksort($ioData);
         }
@@ -328,7 +329,7 @@ function processCodec16($data, &$offset, $endAVL, $recordCount, $connId, &$conne
 
         $timestamp = unpack64be(substr($data, $offset, 8));
         $offset += 8;
-        $datetime = date("Y-m-d H:i:s", $timestamp / 1000);
+        $datetime = teltonikaDatetime($timestamp);
         $priority = ord($data[$offset++]);
         $longitude = parseSignedInt32(substr($data, $offset, 4)) / 10000000;
         $offset += 4;
@@ -353,7 +354,11 @@ function processCodec16($data, &$offset, $endAVL, $recordCount, $connId, &$conne
 
         $ioData = parseIOElements8E($data, $offset, $endAVL, $totalIO); // Codec 16 uses same IO structure as 8E
 
-        $imei = $connectionIMEIs[$connId] ?? 'unknown';
+        $imei = $connectionIMEIs[$connId] ?? null;
+        if ($imei === null) {
+            clilogTracker("Record #$i received before the IMEI handshake — skipped", $protocol_name);
+            continue;
+        }
         if(is_array($ioData) and !empty($ioData)){
             ksort($ioData);
         }
@@ -394,40 +399,43 @@ function parseIOElements($data, &$offset, $endAVL) {
     $eventId = ord($data[$offset++]);
     $totalIO = ord($data[$offset++]);
 
-    // Parse 1-byte values
-    $n1 = ord($data[$offset++]);
-    for ($i = 0; $i < $n1 && $offset + 2 <= $endAVL; $i++) {
-        $id = ord($data[$offset++]);
-        $value = ord($data[$offset++]);
-        $io[$id] = $value;
-    }
+    // ID(1) + value(N) for each block. The block counters themselves were read
+    // without a bounds check before, so a truncated record walked $offset past
+    // the end of the string ("Uninitialized string offset" warnings, and
+    // garbage IO values).
+    $blocks = [1, 2, 4, 8];
+    foreach ($blocks as $size) {
+        if ($offset + 1 > $endAVL) {
+            clilogTracker("Insufficient bytes for N$size counter", $protocol_name);
+            return mapFmbIo($io);
+        }
+        $count = ord($data[$offset++]);
 
-    // Parse 2-byte values
-    $n2 = ord($data[$offset++]);
-    for ($i = 0; $i < $n2 && $offset + 3 <= $endAVL; $i++) {
-        $id = ord($data[$offset++]);
-        $value = unpack("n", substr($data, $offset, 2))[1];
-        $offset += 2;
-        $io[$id] = $value;
-    }
-
-    // Parse 4-byte values
-    $n4 = ord($data[$offset++]);
-    for ($i = 0; $i < $n4 && $offset + 5 <= $endAVL; $i++) {
-        $id = ord($data[$offset++]);
-        $value = unpack("N", substr($data, $offset, 4))[1];
-        $offset += 4;
-        $io[$id] = $value;
-    }
-
-    // Parse 8-byte values
-    $n8 = ord($data[$offset++]);
-    for ($i = 0; $i < $n8 && $offset + 9 <= $endAVL; $i++) {
-        $id = ord($data[$offset++]);
-        $high = unpack("N", substr($data, $offset, 4))[1];
-        $low = unpack("N", substr($data, $offset + 4, 4))[1];
-        $offset += 8;
-        $io[$id] = combineUInt64($high, $low);
+        for ($i = 0; $i < $count; $i++) {
+            if ($offset + 1 + $size > $endAVL) {
+                clilogTracker("Insufficient bytes parsing N$size IO", $protocol_name);
+                return mapFmbIo($io);
+            }
+            $id = ord($data[$offset++]);
+            switch ($size) {
+                case 1:
+                    $value = ord($data[$offset]);
+                    break;
+                case 2:
+                    $value = unpack("n", substr($data, $offset, 2))[1];
+                    break;
+                case 4:
+                    $value = unpack("N", substr($data, $offset, 4))[1];
+                    break;
+                default:
+                    $high  = unpack("N", substr($data, $offset, 4))[1];
+                    $low   = unpack("N", substr($data, $offset + 4, 4))[1];
+                    $value = combineUInt64($high, $low);
+                    break;
+            }
+            $offset += $size;
+            $io[$id] = $value;
+        }
     }
 
     return mapFmbIo($io);
@@ -632,7 +640,11 @@ function mapFmbIo($io) {
                     $result[$mapping[$id]] = round(($value * 0.001), 1);
                     break;
                 case 256:
-                    $result[$mapping[$id]] = hex2bin($value);
+                    // VIN 
+                    $result[$mapping[$id]] = (is_string($value) && strlen($value) % 2 === 0
+                        && ctype_xdigit($value))
+                        ? hex2bin($value)
+                        : $value;
                     break;
                 case 390:
                     $result[$mapping[$id]] = round(($value * 0.1), 1);

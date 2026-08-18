@@ -1,105 +1,147 @@
 <?php
 /**
- * OsmAnd HTTP GPS protocol server
+ * OsmAnd HTTP GPS protocol server (the protocol Traccar exposes on 5055).
  *
- * OsmAnd (and compatible apps) send HTTP POST/GET with JSON body:
- * {
- *   "device_id": "...",
- *   "location": {
- *     "timestamp": "ISO8601",
- *     "coords": { "latitude": ..., "longitude": ..., "speed": ..., "altitude": ... },
- *     "battery": { "level": 0.0-1.0 }
- *   }
- * }
+ * Two request shapes are accepted, because clients in the wild use both:
  *
+ * 1) Query parameters (OsmAnd itself, and most "Traccar Client" apps):
+ *      GET /?id=353816...&lat=50.45&lon=30.52&timestamp=1717171717&speed=12.3
+ *          &bearing=180&altitude=180&batt=87&hdop=0.9
+ *
+ * 2) JSON body (background-geolocation style clients):
+ *      POST / {"device_id":"…","location":{"timestamp":"ISO8601",
+ *              "coords":{"latitude":…,"longitude":…,"speed":…,"altitude":…},
+ *              "battery":{"level":0.0-1.0}}}
  */
 
 $protocol_name = explode('.', basename(__FILE__))[0];
 define('WORK_DIR', dirname(dirname(__FILE__)));
 require_once WORK_DIR . '/config.php';
 require_once WORK_DIR . '/functions.php';
+require_once WORK_DIR . '/gps_server.php';
 
-clilogTracker('Starting GPS server...', $protocol_name);
+$server = gpsBootstrap($protocol_name);
 
-set_time_limit(0);
-ini_set('max_execution_time', 0);
-ini_set('default_socket_timeout', -1);
-ini_set('max_input_time', -1);
-
-$options = getopt('p:');
-if (!isset($options['p']) || (int)$options['p'] <= 0 || (int)$options['p'] >= 65536) {
-    clilogTracker('Invalid or missing port (-p)', $protocol_name);
-    exit(1);
-}
-$port = (int)$options['p'];
-$host = '0.0.0.0';
-
-$server = stream_socket_server("tcp://$host:$port", $errno, $errstr);
-if (!$server) {
-    clilogTracker("Failed to create socket: $errstr ($errno)", $protocol_name);
-    exit(1);
-}
-stream_set_blocking($server, false);
-clilogTracker("Server started on $host:$port", $protocol_name);
-
-$clients  = [];
-$buffers  = [];
-
-while (true) {
-    $read   = array_merge([$server], array_values($clients));
-    $write  = null;
-    $except = null;
-
-    if (stream_select($read, $write, $except, 0, 200000) < 1) {
-        continue;
+$server->run(
+    function ($conn, $id, &$buffers, GpsServer $srv) use ($protocol_name) {
+        processHttpBuffer($conn, $id, $buffers, $srv, $protocol_name);
     }
+);
 
-    foreach ($read as $sock) {
-        if ($sock === $server) {
-            $conn = stream_socket_accept($server);
-            if ($conn) {
-                stream_set_blocking($conn, false);
-                $id = (int)$conn;
-                $clients[$id] = $conn;
+/**
+ * Extract complete HTTP requests from the receive buffer.
+ *
+ * The previous version fired as soon as it saw the header terminator, so any
+ * POST whose body landed in a second TCP segment was parsed with an empty
+ * body and answered with "400 Bad Request".
+ */
+function processHttpBuffer($conn, $id, &$buffers, GpsServer $srv, $protocol_name) {
+    while (true) {
+        $buf = $buffers[$id];
+
+        $headerEnd = strpos($buf, "\r\n\r\n");
+        $sep       = 4;
+        if ($headerEnd === false) {
+            $headerEnd = strpos($buf, "\n\n"); // tolerate LF-only clients
+            $sep       = 2;
+        }
+        if ($headerEnd === false) {
+            if (strlen($buf) > 16384) {
+                clilogTracker('Header too large — dropping connection', $protocol_name);
                 $buffers[$id] = '';
-                clilogTracker('New connection', $protocol_name);
+                $srv->close($id);
             }
-            continue;
+            return;
         }
 
-        $id      = (int)$sock;
-        $payload = fread($sock, 8192);
+        $headers    = substr($buf, 0, $headerEnd);
+        $bodyOffset = $headerEnd + $sep;
 
-        if ($payload === false || $payload === '') {
-            clilogTracker('Connection closed', $protocol_name);
-            unset($clients[$id], $buffers[$id]);
-            fclose($sock);
-            continue;
+        $contentLength = 0;
+        if (preg_match('/^Content-Length:\s*(\d+)/mi', $headers, $m)) {
+            $contentLength = (int)$m[1];
         }
 
-        $buffers[$id] .= $payload;
-
-        // HTTP request ends with \r\n\r\n + body
-        if (strpos($buffers[$id], "\r\n\r\n") !== false) {
-            processGpsData($sock, $buffers[$id], $protocol_name); // FIX: 3 args (no $connectionIMEIs)
-            $buffers[$id] = '';
+        if (strlen($buf) < $bodyOffset + $contentLength) {
+            return; // body still on the wire
         }
+
+        $body         = substr($buf, $bodyOffset, $contentLength);
+        $buffers[$id] = substr($buf, $bodyOffset + $contentLength);
+
+        handleHttpRequest($conn, $headers, $body, $protocol_name);
+
+        // We answer with "Connection: close", so honour it.
+        $srv->close($id);
+        return;
     }
 }
 
-function processGpsData($conn, $raw, $protocol_name) {
-    // Split HTTP headers from body
-    $parts = explode("\r\n\r\n", $raw, 2);
-    if (count($parts) < 2) {
-        clilogTracker('Invalid HTTP payload — no header/body split', $protocol_name);
+function handleHttpRequest($conn, $headers, $body, $protocol_name) {
+    $requestLine = strtok($headers, "\r\n");
+    $parts       = explode(' ', (string)$requestLine);
+    $target      = $parts[1] ?? '/';
+
+    clilogTracker('Request: ' . $requestLine, $protocol_name);
+
+    // ── 1) Query parameters ─────────────────────────
+    $query = [];
+    $qpos  = strpos($target, '?');
+    if ($qpos !== false) {
+        parse_str(substr($target, $qpos + 1), $query);
+    }
+    // A form-encoded body carries the same field names.
+    if ($body !== '' && stripos($headers, 'application/x-www-form-urlencoded') !== false) {
+        $form = [];
+        parse_str($body, $form);
+        $query = array_merge($query, $form);
+    }
+
+    if (isset($query['lat'], $query['lon'])) {
+        $deviceId = (string)($query['id'] ?? $query['deviceid'] ?? $query['device_id'] ?? '');
+        if ($deviceId === '') {
+            clilogTracker('Missing device id in query', $protocol_name);
+            sendHttpResponse($conn, 400);
+            return;
+        }
+
+        $timestamp = '';
+        if (isset($query['timestamp']) && is_numeric($query['timestamp'])) {
+            $timestamp = date('Y-m-d H:i:s', (int)$query['timestamp']);
+        }
+
+        $payload = [
+            'protocol_name' => $protocol_name,
+            'last_alive'    => $timestamp,
+            'lat'           => $query['lat'],
+            'lon'           => $query['lon'],
+        ];
+        // OsmAnd reports speed in m/s.
+        if (isset($query['speed']))    $payload['speed']   = round((float)$query['speed'] * 3.6, 1);
+        if (isset($query['bearing']))  $payload['angle']   = (int)round((float)$query['bearing']);
+        if (isset($query['heading']))  $payload['angle']   = (int)round((float)$query['heading']);
+        if (isset($query['altitude'])) $payload['alt']     = round((float)$query['altitude'], 1);
+        if (isset($query['batt']))     $payload['battery'] = round((float)$query['batt']);
+
+        clilogTracker(
+            "OsmAnd device:$deviceId ts:$timestamp lat:{$query['lat']} lon:{$query['lon']}",
+            $protocol_name
+        );
+
+        sendToGrusher($deviceId, $payload);
+        sendHttpResponse($conn, 200);
+        return;
+    }
+
+    // ── 2) JSON body ────────────────────────────────
+    if ($body === '') {
+        clilogTracker('Empty request — no query parameters and no body', $protocol_name);
         sendHttpResponse($conn, 400);
         return;
     }
-    [, $body] = $parts;
 
-    // Parse JSON body
     $data = json_decode($body, true);
-    if (json_last_error() !== JSON_ERROR_NONE) {
+    if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
         clilogTracker('JSON decode error: ' . json_last_error_msg(), $protocol_name);
         sendHttpResponse($conn, 400);
         return;
@@ -114,13 +156,11 @@ function processGpsData($conn, $raw, $protocol_name) {
     $device_id = (string)$data['device_id'];
     $coords    = $data['location']['coords'];
 
-    // Parse timestamp
     $timestamp = '';
     $tsRaw     = $data['location']['timestamp'] ?? '';
     if ($tsRaw !== '') {
         try {
-            $dt        = new DateTimeImmutable($tsRaw);
-            $timestamp = $dt->format('Y-m-d H:i:s');
+            $timestamp = (new DateTimeImmutable($tsRaw))->format('Y-m-d H:i:s');
         } catch (\Throwable $e) {
             $timestamp = '';
         }
@@ -130,11 +170,12 @@ function processGpsData($conn, $raw, $protocol_name) {
     $lon      = $coords['longitude'] ?? null;
     $speed    = $coords['speed']     ?? null;
     $altitude = $coords['altitude']  ?? null;
+    $heading  = $coords['heading']   ?? null;
     $battery  = $data['location']['battery']['level'] ?? null;
 
-    // Guard against unknown/negative values reported by some clients
-    $speed   = ($speed   !== null && $speed   >= 0) ? round($speed   * 3.6, 1) : 0; // m/s → km/h
-    $battery = ($battery !== null && $battery >= 0) ? round($battery * 100)    : null;
+    // Guard against the "unknown" sentinel (-1) some clients report
+    $speed   = ($speed   !== null && $speed   >= 0) ? round($speed * 3.6, 1) : 0; // m/s → km/h
+    $battery = ($battery !== null && $battery >= 0) ? round($battery * 100)  : null;
 
     clilogTracker(
         "OsmAnd device:$device_id ts:$timestamp lat:$lat lon:$lon spd:$speed alt:$altitude bat:$battery",
@@ -149,9 +190,8 @@ function processGpsData($conn, $raw, $protocol_name) {
         'speed'         => $speed,
         'alt'           => $altitude,
     ];
-    if ($battery !== null) {
-        $payload['battery'] = $battery;
-    }
+    if ($battery !== null)                  $payload['battery'] = $battery;
+    if ($heading !== null && $heading >= 0) $payload['angle']   = (int)round((float)$heading);
 
     sendToGrusher($device_id, $payload);
     sendHttpResponse($conn, 200);
@@ -159,6 +199,11 @@ function processGpsData($conn, $raw, $protocol_name) {
 
 function sendHttpResponse($conn, int $code) {
     $text = $code === 200 ? 'OK' : 'Bad Request';
-    $body = $code === 200 ? 'OK' : 'Bad Request';
-    fwrite($conn, "HTTP/1.1 $code $text\r\nContent-Length: " . strlen($body) . "\r\nConnection: close\r\n\r\n$body");
+    safeFwrite(
+        $conn,
+        "HTTP/1.1 $code $text\r\n" .
+        "Content-Type: text/plain\r\n" .
+        'Content-Length: ' . strlen($text) . "\r\n" .
+        "Connection: close\r\n\r\n" . $text
+    );
 }

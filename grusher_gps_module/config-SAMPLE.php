@@ -10,14 +10,33 @@
     // ── Grusher ──────────────────────────────────
     $GRUSHER_URL     = 'http://192.168.1.1';
     $GRUSHER_API_KEY = 'key';
-    $GRUSHER_TIMEOUT = 2;
+    $GRUSHER_TIMEOUT = 2;   // total time budget for one request, seconds
+
+    // Hard cap on the TCP/TLS handshake. Without it an unreachable Grusher
+    // blocks the listener for the OS connect timeout (~2 minutes).
+    $GRUSHER_CONNECT_TIMEOUT = 3;
 
     // Set to false only for self-signed certs / internal HTTP deployments
     $GRUSHER_SSL_VERIFY = false;
 
+    // ── Grusher failure handling ─────────────────
+    // Requests are sent asynchronously; these bound the damage when Grusher
+    // is down so the listeners keep accepting packets from the trackers.
+    $GRUSHER_MAX_INFLIGHT      = 64; // queued requests before new ones are dropped
+    $GRUSHER_FAIL_THRESHOLD    = 3;  // consecutive failures that trip the breaker
+    $GRUSHER_BREAKER_COOLDOWN  = 30; // seconds to stop sending after tripping
+
+    // ── Listener limits ──────────────────────────
+    $max_clients        = 400;      // select() cannot watch more than ~1024 handles
+    $client_idle_timeout = 900;     // drop a connection after N seconds of silence
+    $max_client_buffer  = 262144;   // per-connection receive buffer cap, bytes
+
     // ── Logging ──────────────────────────────────
     $write_start_script_log = 1;
     $write_gps_log          = 1;
+    $log_to_stdout          = 1;    // set to 0 when running under cron/systemd
+    $log_grusher_requests   = 1;    // log every outgoing API call (verbose)
+    $log_max_bytes          = 33554432; // rotate a log file once it exceeds this
 
     // ── Protocol ports ───────────────────────────
     // Comment out protocols you do not use.

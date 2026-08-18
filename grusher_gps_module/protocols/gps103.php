@@ -2,161 +2,175 @@
 /**
  * GPS103 / TK103-clone GPS protocol server (text-based)
  *
- * Packet format (ASCII, terminated by \r\n):
- *   Login : imei:XXXXXXXXXXXXXXX,tracker;
- *   GPS   : imei:...,tracker,DDMMYYHHMMSS,,F,DDMM.MMMM,N,DDDMM.MMMM,E,speed,course;
+ * Real on-the-wire formats (ASCII, terminated by ';' and usually \r\n):
  *
+ *   Login     : ##,imei:359586015829802,A;          → reply "LOAD"
+ *   Heartbeat : 359586015829802;                    → reply "ON"
+ *   Position  : imei:359586015829802,tracker,1809231929,,F,112909.397,A,
+ *               2234.4669,N,11354.3287,E,0.11,0;
+ *
+ * Field layout of a position line:
+ *   [0] imei:<digits>   [1] alarm/type      [2] YYMMDDHHMM   [3] phone number
+ *   [4] F|L             [5] HHMMSS.sss      [6] A|V          [7] DDMM.MMMM
+ *   [8] N|S             [9] DDDMM.MMMM     [10] E|W         [11] speed (knots)
+ *  [12] course
+ *
+ * NOTE: position lines start with "imei:" as well. The previous version
+ * treated every such line as a login handshake and returned immediately, so no
+ * position was ever forwarded; the field indexes it used were shifted by one
+ * on top of that.
  */
 
 $protocol_name = explode('.', basename(__FILE__))[0];
 define('WORK_DIR', dirname(dirname(__FILE__)));
 require_once WORK_DIR . '/config.php';
 require_once WORK_DIR . '/functions.php';
+require_once WORK_DIR . '/gps_server.php';
 
-clilogTracker('Starting server...', $protocol_name);
-
-set_time_limit(0);
-ini_set('max_execution_time', 0);
-ini_set('default_socket_timeout', -1);
-ini_set('max_input_time', -1);
-
-$options = getopt('p:');
-if (!isset($options['p']) || (int)$options['p'] <= 0 || (int)$options['p'] >= 65536) {
-    clilogTracker('Invalid or missing port (-p)', $protocol_name);
-    exit(1);
-}
-$port = (int)$options['p'];
-$host = '0.0.0.0';
-
-$server = stream_socket_server("tcp://$host:$port", $errno, $errstr);
-if (!$server) {
-    clilogTracker("Cannot create socket: $errstr ($errno)", $protocol_name);
-    exit(1);
-}
-stream_set_blocking($server, false);
-clilogTracker("Server started on $host:$port", $protocol_name);
-
-$clients         = [];
 $connectionIMEIs = [];
-$buffers         = [];
 
-while (true) {
-    $read   = array_merge([$server], array_values($clients));
-    $write  = null;
-    $except = null;
+$server = gpsBootstrap($protocol_name);
 
-    if (stream_select($read, $write, $except, 0, 200000) < 1) {
-        continue;
+$server->run(
+    function ($conn, $id, &$buffers, GpsServer $srv) use (&$connectionIMEIs, $protocol_name) {
+        gps103ReadLines($conn, $id, $buffers, $connectionIMEIs, $protocol_name);
+    },
+    function ($id) use (&$connectionIMEIs) {
+        unset($connectionIMEIs[$id]);
     }
+);
 
-    foreach ($read as $sock) {
-        if ($sock === $server) {
-            $conn = stream_socket_accept($server);
-            if ($conn) {
-                stream_set_blocking($conn, false);
-                $id = (int)$conn;
-                $clients[$id] = $conn;
-                $buffers[$id] = '';
-                clilogTracker('New connection', $protocol_name);
-            }
-            continue;
+/**
+ * Split the buffer into messages. Devices terminate with ';' and most, but not
+ * all, firmwares add \r\n — splitting on the newline alone leaves the last
+ * message stuck in the buffer forever on the ones that do not.
+ */
+function gps103ReadLines($conn, $id, &$buffers, &$connectionIMEIs, $protocol_name) {
+    while (true) {
+        $buf = $buffers[$id];
+        $pos = strpos($buf, ';');
+        if ($pos === false) {
+            $nl = strpos($buf, "\n");
+            if ($nl === false) return;
+            $pos = $nl;
         }
 
-        $id   = (int)$sock;
-        $data = fread($sock, 2048);
+        $line         = trim(substr($buf, 0, $pos + 1), " \t\r\n;");
+        $buffers[$id] = ltrim(substr($buf, $pos + 1), "\r\n");
 
-        if ($data === false || $data === '') {
-            clilogTracker('Connection closed', $protocol_name);
-            fclose($sock);
-            unset($clients[$id], $connectionIMEIs[$id], $buffers[$id]);
-            continue;
-        }
-
-        $buffers[$id] .= $data;
-
-        // Process complete lines (terminated by \r\n or \n)
-        while (($pos = strpos($buffers[$id], "\n")) !== false) {
-            $line           = rtrim(substr($buffers[$id], 0, $pos), "\r\n");
-            $buffers[$id]   = substr($buffers[$id], $pos + 1);
-            if ($line === '') continue;
-            clilogTracker("Line: $line", $protocol_name);
-            parseGPS103Line($sock, $line, $id, $connectionIMEIs, $protocol_name);
-        }
+        if ($line === '') continue;
+        clilogTracker("Line: $line", $protocol_name);
+        parseGPS103Line($conn, $line, $id, $connectionIMEIs, $protocol_name);
     }
 }
 
 // ─────────────────────────────────────────────────────
 function parseGPS103Line($conn, $line, $id, &$connectionIMEIs, $protocol_name) {
-    // Strip trailing semicolon if present
-    $line = rtrim($line, ';');
-
     $parts = explode(',', $line);
 
-    // ── Login packet: imei:XXXXXXXXXXXXXXX,tracker ──
-    if (str_starts_with($parts[0], 'imei:')) {
-        $imei = substr($parts[0], 5);
-        $imei = preg_replace('/\D/', '', $imei);
+    // ── Login: ##,imei:<digits>,A ───────────────────
+    if ($parts[0] === '##') {
+        foreach ($parts as $p) {
+            if (str_starts_with($p, 'imei:')) {
+                $connectionIMEIs[$id] = preg_replace('/\D/', '', substr($p, 5));
+            }
+        }
+        clilogTracker('Login IMEI: ' . ($connectionIMEIs[$id] ?? '?'), $protocol_name);
+        safeFwrite($conn, "LOAD\r\n");
+        return;
+    }
+
+    // ── Heartbeat: bare IMEI digits ─────────────────
+    if (count($parts) === 1 && preg_match('/^\d{10,17}$/', $parts[0])) {
+        $connectionIMEIs[$id] = $parts[0];
+        clilogTracker('Heartbeat from ' . $parts[0], $protocol_name);
+        safeFwrite($conn, "ON\r\n");
+        return;
+    }
+
+    if (!str_starts_with($parts[0], 'imei:')) {
+        clilogTracker("Unrecognised message: $line", $protocol_name);
+        return;
+    }
+
+    $imei = preg_replace('/\D/', '', substr($parts[0], 5));
+    if ($imei !== '') {
         $connectionIMEIs[$id] = $imei;
-        clilogTracker("IMEI: $imei", $protocol_name);
-        // ACK: device expects "LOAD" or just no reply — no ACK needed for login
+    } else {
+        $imei = $connectionIMEIs[$id] ?? '';
+    }
+    if ($imei === '') {
+        clilogTracker('No IMEI — ignored', $protocol_name);
         return;
     }
 
-    // ── Data packet ─────────────────────────────────
-    if (!isset($connectionIMEIs[$id])) {
-        clilogTracker('No IMEI yet — ignored', $protocol_name);
-        return;
-    }
-    $imei = $connectionIMEIs[$id];
-
-    // Minimum fields: [type, datetime, alarm, validity, lat, NS, lon, EW, speed, ...]
-    if (count($parts) < 9) {
-        clilogTracker("Too few fields ($line)", $protocol_name);
+    // Short frames are keep-alives / command replies, not positions.
+    if (count($parts) < 12) {
+        clilogTracker("IMEI $imei: non-position message (" . count($parts) . ' fields)', $protocol_name);
+        safeFwrite($conn, "ON\r\n");
         return;
     }
 
-    $validity = strtoupper(trim($parts[3]));
-    if ($validity !== 'F') {
-        clilogTracker("GPS invalid (validity=$validity)", $protocol_name);
-        fwrite($conn, "ON\r\n"); // keep alive even on invalid fix
+    $alarm    = trim($parts[1]);
+    $gpsFlag  = strtoupper(trim($parts[4]));   // F = GPS fix, L = LBS only
+    $validity = strtoupper(trim($parts[6]));   // A = valid, V = invalid
+
+    if ($gpsFlag !== 'F' || ($validity !== '' && $validity !== 'A')) {
+        clilogTracker("IMEI $imei: no GPS fix (flag=$gpsFlag validity=$validity)", $protocol_name);
+        safeFwrite($conn, "ON\r\n"); 
         return;
     }
 
-    // Date/time: DDMMYYHHMMSS (12 chars) or DDMMYYHHMM (10 chars)
-    $dt = $parts[1];
-    if (strlen($dt) < 10) {
-        clilogTracker("Bad datetime: $dt", $protocol_name);
-        return;
-    }
-    $day   = substr($dt, 0, 2);
-    $mon   = substr($dt, 2, 2);
-    $yr    = 2000 + (int)substr($dt, 4, 2);
-    $hr    = substr($dt, 6, 2);
-    $min   = substr($dt, 8, 2);
-    $sec   = strlen($dt) >= 12 ? substr($dt, 10, 2) : '00';
-    $datetime = sprintf('%04d-%02d-%02d %02d:%02d:%02d', $yr, $mon, $day, $hr, $min, $sec);
+    $datetime = gps103Datetime(trim($parts[2]), trim($parts[5]));
 
     // Coordinates: NMEA DDMM.MMMM → decimal degrees
-    $lat = nmeaToDecimal((float)$parts[4], strtoupper($parts[5]));
-    $lon = nmeaToDecimal((float)$parts[6], strtoupper($parts[7]));
+    $lat = nmeaToDecimal((float)$parts[7], strtoupper(trim($parts[8])));
+    $lon = nmeaToDecimal((float)$parts[9], strtoupper(trim($parts[10])));
 
     // Speed: knots → km/h
-    $speed_kmh = round((float)$parts[8] * 1.852, 1);
+    $speed_kmh = round((float)$parts[11] * 1.852, 1);
+    $course    = isset($parts[12]) && is_numeric(trim($parts[12]))
+        ? (int)round((float)$parts[12])
+        : null;
 
     clilogTracker(
-        "GPS103 IMEI:$imei $datetime Lat:$lat Lon:$lon Spd:{$speed_kmh}km/h",
+        "GPS103 IMEI:$imei $datetime Lat:$lat Lon:$lon Spd:{$speed_kmh}km/h Crs:$course Alarm:$alarm",
         $protocol_name
     );
 
-    sendToGrusher($imei, [
+    $payload = [
         'protocol_name' => $protocol_name,
         'last_alive'    => $datetime,
         'lat'           => $lat,
         'lon'           => $lon,
         'speed'         => $speed_kmh,
-    ]);
+    ];
+    if ($course !== null) $payload['angle'] = $course;
 
-    fwrite($conn, "ON\r\n");
+    sendToGrusher($imei, $payload);
+
+    safeFwrite($conn, "ON\r\n");
+}
+
+function gps103Datetime(string $date, string $time): string {
+    if (!preg_match('/^\d{10,}$/', $date) || (int)$date === 0) return '';
+
+    $year  = 2000 + (int)substr($date, 0, 2);
+    $month = (int)substr($date, 2, 2);
+    $day   = (int)substr($date, 4, 2);
+    $hour  = (int)substr($date, 6, 2);
+    $min   = (int)substr($date, 8, 2);
+    $sec   = 0;
+
+    if (preg_match('/^(\d{2})(\d{2})(\d{2})/', $time, $m)) {
+        $hour = (int)$m[1];
+        $min  = (int)$m[2];
+        $sec  = (int)$m[3];
+    }
+
+    if (!checkdate($month, $day, $year)) return '';
+
+    return sprintf('%04d-%02d-%02d %02d:%02d:%02d', $year, $month, $day, $hour, $min, $sec);
 }
 
 /**

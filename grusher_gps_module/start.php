@@ -7,6 +7,11 @@
     require_once WORK_DIR . '/config.php';
     require_once WORK_DIR . '/functions.php';
 
+    // Logging writes here on the very first call below.
+    if (!is_dir(WORK_DIR . '/logs')) {
+        @mkdir(WORK_DIR . '/logs', 0775, true);
+    }
+
     clilog('Starting script...');
     clilog('PROTOCOLS DIR: ' . WORK_DIR . '/protocols');
     clilog('LOGS DIR: '      . WORK_DIR . '/logs');
@@ -45,14 +50,24 @@
             continue;
         }
 
+        $port = (int)$port;
+        if ($port <= 0 || $port >= 65536) {
+            clilog('ERROR: invalid port "' . $port . '" for ' . $protocol);
+            continue;
+        }
+
         clilog('Checking port ' . $port . ' for ' . $protocol . '...');
-        if (isPortAvailable($localHostIp, $port, 2) !== 1) {
+        // Listeners bind 0.0.0.0, so a successful connect to 127.0.0.1 means one is already up. A short timeout keeps this loop well under the one-minute cron interval even with every protocol enabled.
+        if (isPortAvailable($localHostIp, $port, 1) !== 1) {
             clilog('SKIP: port ' . $port . ' already in use (is ' . $protocol . ' already running?)');
             continue;
         }
 
         clilog('Launching ' . $protocol . ' on port ' . $port . '...');
-        shell_exec($php_path . ' ' . escapeshellarg($filepath) . ' -p ' . (int)$port . ' > /dev/null 2>&1 &');
+        // setsid detaches the listener from this script's session, so it is not killed when cron reaps the process group of a finished job.
+        $cmd = 'setsid ' . escapeshellarg($php_path) . ' ' . escapeshellarg($filepath)
+             . ' -p ' . $port . ' < /dev/null > /dev/null 2>&1 &';
+        shell_exec($cmd);
     }
 
     clilog('');

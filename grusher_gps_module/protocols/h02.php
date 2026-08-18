@@ -1,197 +1,213 @@
 <?php
 /**
- * H02 GPS protocol server (binary TCP)
+ * H02 GPS protocol server
  *
- * Packet format:
- *   Start   : 0x2424 ("$$")
- *   Len     : 1 byte
- *   Cmd     : 1 byte  (0x10 = GPS location, 0x80 = alarm location)
- *   Datetime: 7 bytes (YY MM DD HH MM SS — BCD packed)
- *   Lat     : 4 bytes (degrees BCD, minutes BCD, decimal minutes BCD×100)
- *   N/S     : 1 byte  ASCII 'N' or 'S'
- *   Lon     : 4 bytes
- *   E/W     : 1 byte  ASCII 'E' or 'W'
- *   Speed   : 1 byte
- *   ... course, status, IMEI ...
- *   End     : 0x0D0A
+ * H02 devices speak one of two dialects on the same port:
  *
- * H02 embeds the IMEI inside the packet body (not a separate login),
- * so we extract it from every packet.
+ * 1) Text (by far the most common — "HQ" firmwares):
+ *      *HQ,<imei>,V1,HHMMSS,A,DDMM.MMMM,N,DDDMM.MMMM,E,speed,course,DDMMYY,status#
+ *      *HQ,<imei>,XT,...#     (heartbeat / config — answered, not stored)
  *
+ * 2) Binary:
+ *      Start   : 0x2424 ("$$")
+ *      Len     : 1 byte  (total packet length, including the "$$" and length byte)
+ *      Cmd     : 1 byte  (0x10 = location, 0x80 = alarm location)
+ *      [4..9]  : YY MM DD HH MM SS  (BCD)
+ *      [10..13]: latitude  DD MM.MMMM (BCD)      [14] : 'N'/'S'
+ *      [15..18]: longitude DDD MM.MMMM (BCD)     [19] : 'E'/'W'
+ *      [20]    : speed (BCD)                     [21..22]: course (BCD)
+ *      [23..29]: IMEI (BCD)
  */
 
 $protocol_name = explode('.', basename(__FILE__))[0];
 define('WORK_DIR', dirname(dirname(__FILE__)));
 require_once WORK_DIR . '/config.php';
 require_once WORK_DIR . '/functions.php';
+require_once WORK_DIR . '/gps_server.php';
 
-clilogTracker('Starting server...', $protocol_name);
+$server = gpsBootstrap($protocol_name);
 
-set_time_limit(0);
-ini_set('max_execution_time', 0);
-ini_set('default_socket_timeout', -1);
-ini_set('max_input_time', -1);
-
-$options = getopt('p:');
-if (!isset($options['p']) || (int)$options['p'] <= 0 || (int)$options['p'] >= 65536) {
-    clilogTracker('Invalid or missing port (-p)', $protocol_name);
-    exit(1);
-}
-$port = (int)$options['p'];
-$host = '0.0.0.0';
-
-$server = stream_socket_server("tcp://$host:$port", $errno, $errstr);
-if (!$server) {
-    clilogTracker("Cannot create socket: $errstr ($errno)", $protocol_name);
-    exit(1);
-}
-stream_set_blocking($server, false);
-clilogTracker("Server started on $host:$port", $protocol_name);
-
-$clients  = [];
-$buffers  = [];
-
-while (true) {
-    $read   = array_merge([$server], array_values($clients));
-    $write  = null;
-    $except = null;
-
-    if (stream_select($read, $write, $except, 0, 200000) < 1) {
-        continue;
+$server->run(
+    function ($conn, $id, &$buffers, GpsServer $srv) use ($protocol_name) {
+        processH02Buffer($conn, $id, $buffers, $srv, $protocol_name);
     }
+);
 
-    foreach ($read as $sock) {
-        if ($sock === $server) {
-            $conn = stream_socket_accept($server);
-            if ($conn) {
-                stream_set_blocking($conn, false);
-                $id = (int)$conn;
-                $clients[$id] = $conn;
-                $buffers[$id] = '';
-                clilogTracker('New connection', $protocol_name);
-            }
-            continue;
-        }
-
-        $id   = (int)$sock;
-        $data = fread($sock, 2048);
-
-        if ($data === false || $data === '') {
-            clilogTracker('Connection closed', $protocol_name);
-            fclose($sock);
-            unset($clients[$id], $buffers[$id]);
-            continue;
-        }
-
-        $buffers[$id] .= $data;
-        processH02Buffer($sock, $id, $buffers, $protocol_name);
-    }
-}
-
-// ─────────────────────────────────────────────────────
-function processH02Buffer($conn, $id, &$buffers, $protocol_name) {
+function processH02Buffer($conn, $id, &$buffers, GpsServer $srv, $protocol_name) {
     while (true) {
         $buf = $buffers[$id];
         $len = strlen($buf);
+        if ($len < 5) return;
 
-        // Find "$$" start marker
-        $start = strpos($buf, "\x24\x24");
-        if ($start === false) {
-            // No marker — discard all but last byte (could be partial "$$")
-            if ($len > 1) $buffers[$id] = substr($buf, -1);
+        $textStart = strpos($buf, '*');
+        $binStart  = strpos($buf, "\x24\x24");
+
+        // Nothing recognisable at all — keep only a short tail so the buffer cannot grow without bound while we resynchronise.
+        if ($textStart === false && $binStart === false) {
+            $buffers[$id] = substr($buf, -1);
             return;
         }
-        if ($start > 0) {
-            $buffers[$id] = substr($buf, $start);
-            $buf = $buffers[$id];
-            $len = strlen($buf);
+
+        $useText = ($textStart !== false) && ($binStart === false || $textStart < $binStart);
+
+        if ($useText) {
+            if ($textStart > 0) {
+                $buffers[$id] = substr($buf, $textStart);
+                continue;
+            }
+            $end = strpos($buf, '#');
+            if ($end === false) {
+                // Guard against a peer that sends '*' and never a '#'.
+                if ($len > 1024) $buffers[$id] = '';
+                return;
+            }
+            $packet       = substr($buf, 0, $end + 1);
+            $buffers[$id] = substr($buf, $end + 1);
+            clilogTracker('RAW: ' . $packet, $protocol_name);
+            parseH02Text($conn, $packet, $protocol_name);
+            continue;
         }
 
-        if ($len < 3) return;
-        $pktLen = ord($buf[2]); // declared body length
-        $total  = 2 + 1 + $pktLen; // "$$" + len byte + body
+        // ── Binary frame ────────────────────────────
+        if ($binStart > 0) {
+            $buffers[$id] = substr($buf, $binStart);
+            continue;
+        }
 
-        if ($len < $total) return;
+        $total = ord($buf[2]); // declared *total* packet length
+        if ($total < 5 || $total > 255) {
+            clilogTracker('Invalid binary length ' . $total . ' — resyncing', $protocol_name);
+            $buffers[$id] = substr($buf, 2); // skip past this "$$"
+            continue;
+        }
+        if ($len < $total) return; // wait for the rest
 
         $packet       = substr($buf, 0, $total);
         $buffers[$id] = substr($buf, $total);
 
         clilogTracker('RAW: ' . bin2hex($packet), $protocol_name);
-        parseH02Packet($conn, $packet, $protocol_name);
+        parseH02Binary($conn, $packet, $protocol_name);
     }
 }
 
-function parseH02Packet($conn, $packet, $protocol_name) {
-    if (strlen($packet) < 4) return;
+// ─────────────────────────────────────────────────────
+// Text dialect: *HQ,imei,V1,HHMMSS,A,lat,N,lon,E,speed,course,DDMMYY,status#
+// ─────────────────────────────────────────────────────
+function parseH02Text($conn, $packet, $protocol_name) {
+    $body  = trim($packet, "*#\r\n");
+    $parts = explode(',', $body);
 
-    $cmd = ord($packet[3]);
-
-    // Only handle location packets (0x10 standard, 0x80 alarm)
-    if ($cmd !== 0x10 && $cmd !== 0x80) {
-        clilogTracker('Unknown H02 command 0x' . dechex($cmd), $protocol_name);
+    if (count($parts) < 3) {
+        clilogTracker('Malformed text packet: ' . $body, $protocol_name);
         return;
     }
 
-    if (strlen($packet) < 32) {
+    $imei = preg_replace('/\D/', '', $parts[1]);
+    $type = strtoupper(trim($parts[2]));
+
+    // Location frames. V1/V4 carry a fix; heartbeats (HTBT/XT/…) do not.
+    if ($type !== 'V1' && $type !== 'V4' && $type !== 'V19') {
+        clilogTracker("IMEI $imei: non-location frame '$type'", $protocol_name);
+        safeFwrite($conn, "*HQ,$imei,$type,OK#");
+        return;
+    }
+
+    if (count($parts) < 12) {
+        clilogTracker('Too few fields in text packet: ' . $body, $protocol_name);
+        return;
+    }
+
+    $timeRaw  = trim($parts[3]);              // HHMMSS
+    $validity = strtoupper(trim($parts[4]));  // A = valid, V = invalid
+    $dateRaw  = trim($parts[11]);             // DDMMYY
+
+    if ($validity !== 'A') {
+        clilogTracker("IMEI $imei: GPS not fixed (validity=$validity)", $protocol_name);
+        safeFwrite($conn, "*HQ,$imei,V1,OK#");
+        return;
+    }
+
+    $datetime = '';
+    if (preg_match('/^\d{6}$/', $dateRaw) && preg_match('/^\d{6}$/', $timeRaw)) {
+        $datetime = sprintf(
+            '%04d-%02d-%02d %02d:%02d:%02d',
+            2000 + (int)substr($dateRaw, 4, 2),
+            (int)substr($dateRaw, 2, 2),
+            (int)substr($dateRaw, 0, 2),
+            (int)substr($timeRaw, 0, 2),
+            (int)substr($timeRaw, 2, 2),
+            (int)substr($timeRaw, 4, 2)
+        );
+    }
+
+    $lat   = h02NmeaToDecimal((float)$parts[5], strtoupper(trim($parts[6])));
+    $lon   = h02NmeaToDecimal((float)$parts[7], strtoupper(trim($parts[8])));
+    $speed = round((float)$parts[9] * 1.852, 1); // knots → km/h
+    $angle = (int)round((float)$parts[10]);
+
+    clilogTracker(
+        "H02 IMEI:$imei $datetime Lat:$lat Lon:$lon Spd:{$speed}km/h Crs:$angle",
+        $protocol_name
+    );
+
+    sendToGrusher($imei, [
+        'protocol_name' => $protocol_name,
+        'last_alive'    => $datetime,
+        'lat'           => $lat,
+        'lon'           => $lon,
+        'speed'         => $speed,
+        'angle'         => $angle,
+    ]);
+
+    safeFwrite($conn, "*HQ,$imei,V1,OK#");
+}
+
+// ─────────────────────────────────────────────────────
+// Binary dialect
+// ─────────────────────────────────────────────────────
+function parseH02Binary($conn, $packet, $protocol_name) {
+    if (strlen($packet) < 4) return;
+
+    $cmd = ord($packet[3]);
+    if ($cmd !== 0x10 && $cmd !== 0x80) {
+        clilogTracker('Unknown H02 command 0x' . sprintf('%02X', $cmd), $protocol_name);
+        return;
+    }
+    if (strlen($packet) < 30) {
         clilogTracker('Packet too short for location data', $protocol_name);
         return;
     }
 
-    // Bytes 4-6: YY MM DD (BCD)
-    // Bytes 7-9: HH MM SS (BCD) — NOTE: time comes AFTER the N/S in some variants
-    // The layout below matches the most common H02 variant (0x2424 len 0x10 ...):
-    //   [0-1]=$$  [2]=len  [3]=cmd
-    //   [4]=YY  [5]=MM  [6]=DD  [7]=HH  [8]=MM  [9]=SS
-    //   [10-13]=lat(BCD deg+min)  [14]=N/S
-    //   [15-18]=lon(BCD deg+min)  [19]=E/W
-    //   [20]=speed  [21-22]=course  [23-29]=IMEI(BCD 7bytes=14digits+parity)
-    //   ... [last-2,last-1]=0D0A
+    $datetime = sprintf(
+        '%04d-%02d-%02d %02d:%02d:%02d',
+        2000 + bcdByte($packet[4]),  // YY
+        bcdByte($packet[5]),         // MM
+        bcdByte($packet[6]),         // DD
+        bcdByte($packet[7]),
+        bcdByte($packet[8]),
+        bcdByte($packet[9])
+    );
 
-    $year  = bcdByte($packet[4])  + 2000;
-    $month = bcdByte($packet[5]);
-    $day   = bcdByte($packet[6]);
-    $hour  = bcdByte($packet[7]);
-    $min   = bcdByte($packet[8]);
-    $sec   = bcdByte($packet[9]);
-    $datetime = sprintf('%04d-%02d-%02d %02d:%02d:%02d', $year, $month, $day, $hour, $min, $sec);
+    // Latitude: 4 BCD bytes → 8 digits "DDMMMMMM" = DD° MM.MMMM'
+    $latDigits = bcdDigits(substr($packet, 10, 4));
+    $latitude  = (int)substr($latDigits, 0, 2)
+               + ((float)(substr($latDigits, 2, 2) . '.' . substr($latDigits, 4, 4))) / 60.0;
+    if (strtoupper($packet[14]) === 'S') $latitude = -$latitude;
 
-    // Latitude: bytes 10-13 BCD → DD + MM.mm
-    $latDeg   = bcdByte($packet[10]);
-    $latMin   = bcdByte($packet[11]);
-    $latMinD  = bcdByte($packet[12]) * 0.01 + bcdByte($packet[13]) * 0.0001;
-    $latitude = $latDeg + ($latMin + $latMinD) / 60.0;
-    $ns       = chr(ord($packet[14]));
-    if ($ns === 'S') $latitude = -$latitude;
-
-    // Longitude: bytes 15-18 BCD → DDD + MM.mm
-    $lonDeg   = bcdByte($packet[15]) * 10 + (($packet[16] >> 4) & 0x0F); // 3 BCD digits for degrees
-    // Simpler approach: treat as 2-byte degree + 2-byte minute
-    $lonDeg   = bcdByte($packet[15]);
-    // Handle 3-digit degrees (>= 100): high nibble of byte15 carries the hundreds
-    $hi = (ord($packet[15]) >> 4) & 0x0F;
-    $lo = ord($packet[15]) & 0x0F;
-    // When degrees ≥ 100, byte15 high nibble = hundreds digit
-    // We read it as: degrees = BCD(byte15)×10 if >9 else standard
-    // Most robust: read as 4 BCD digits across bytes 15-16 for degrees+min start
-    $lonDeg   = $hi * 100 + $lo * 10 + ((ord($packet[16]) >> 4) & 0x0F);
-    $lonMin   = (ord($packet[16]) & 0x0F) * 10 + ((ord($packet[17]) >> 4) & 0x0F);
-    $lonMinD  = (ord($packet[17]) & 0x0F) * 0.1 + ((ord($packet[18]) >> 4) & 0x0F) * 0.01
-                + (ord($packet[18]) & 0x0F) * 0.001;
-    $longitude = $lonDeg + ($lonMin + $lonMinD) / 60.0;
-    $ew        = chr(ord($packet[19]));
-    if ($ew === 'W') $longitude = -$longitude;
+    // Longitude: 4 BCD bytes → 8 digits "DDDMMMMM" = DDD° MM.MMM'
+    $lonDigits = bcdDigits(substr($packet, 15, 4));
+    $longitude = (int)substr($lonDigits, 0, 3)
+               + ((float)(substr($lonDigits, 3, 2) . '.' . substr($lonDigits, 5, 3))) / 60.0;
+    if (strtoupper($packet[19]) === 'W') $longitude = -$longitude;
 
     $speed = bcdByte($packet[20]);
+    $angle = (int)bcdDigits(substr($packet, 21, 2));
 
-    // IMEI: bytes 23-29, 7 bytes BCD = 14 hex digits (last nibble = checksum)
-    $imeiHex = '';
-    for ($i = 23; $i <= 29 && $i < strlen($packet); $i++) {
-        $imeiHex .= sprintf('%02X', ord($packet[$i]));
-    }
-    $imei = substr($imeiHex, 0, 15); // take 15 digits
+    // Device id: 7 BCD bytes → 14 digits (as in the original implementation).
+    $imei = bcdDigits(substr($packet, 23, 7));
 
     clilogTracker(
-        "H02 IMEI:$imei $datetime Lat:$latitude Lon:$longitude Spd:$speed",
+        "H02 IMEI:$imei $datetime Lat:$latitude Lon:$longitude Spd:$speed Crs:$angle",
         $protocol_name
     );
 
@@ -201,14 +217,41 @@ function parseH02Packet($conn, $packet, $protocol_name) {
         'lat'           => $latitude,
         'lon'           => $longitude,
         'speed'         => $speed,
+        'angle'         => $angle,
     ]);
 
-    // ACK
-    fwrite($conn, hex2bin('2424' . '05' . dechex($cmd) . '00' . '010D0A'));
+    // ACK — sprintf with a fixed width so hex2bin() can never be handed an
+    // odd-length string. dechex($cmd) produced one character for $cmd < 0x10.
+    $ack = @hex2bin(sprintf('242405%02X00010D0A', $cmd));
+    if ($ack !== false) safeFwrite($conn, $ack);
 }
 
-/** Decode one BCD byte to decimal integer */
+/** Decode one BCD byte to a decimal integer. */
 function bcdByte(string $byte): int {
     $b = ord($byte);
     return (($b >> 4) & 0x0F) * 10 + ($b & 0x0F);
+}
+
+/**
+ * Decode a run of BCD bytes into its digit string ("\x12\x34" → "1234").
+ *
+ * Uses %02X so that every byte contributes exactly two characters — a stray
+ * A–F nibble from a corrupt packet keeps the field alignment intact instead of
+ * shifting every following digit.
+ */
+function bcdDigits(string $bytes): string {
+    $out = '';
+    $len = strlen($bytes);
+    for ($i = 0; $i < $len; $i++) {
+        $out .= sprintf('%02X', ord($bytes[$i]));
+    }
+    return $out;
+}
+
+/** NMEA DDMM.MMMM → decimal degrees. */
+function h02NmeaToDecimal(float $nmea, string $dir): float {
+    $degrees = floor($nmea / 100.0);
+    $minutes = $nmea - $degrees * 100.0;
+    $decimal = $degrees + $minutes / 60.0;
+    return ($dir === 'S' || $dir === 'W') ? -$decimal : $decimal;
 }
